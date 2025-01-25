@@ -6,6 +6,10 @@
 #include <semaphore.h>
 #include <fcntl.h>
 #include <string.h>
+#include <sys/select.h>
+#include <sys/types.h>
+#include <errno.h>
+
 
 #define READ 0
 #define WRITE 1
@@ -31,6 +35,7 @@ void check_UInput(int, char**);
 void cleanup(int, int, ParentInfo *);
 int readFromPipe(int, char*, char);
 int writeToPipe(int, char*, char);
+int calculateMaxFD(int[2] , int[2] , int);
 
 int main (int argc, char *argv[]){
     //Παίρνουμε τα ορίσματα
@@ -73,6 +78,7 @@ int main (int argc, char *argv[]){
     //Διαδικασία fork
     pid_t pid;
     ChildInfo child_info;
+    int maxFD = 0;
 
     for (int i=0; i<children; i++){
         //Δημιουργία 2 pipes
@@ -81,6 +87,8 @@ int main (int argc, char *argv[]){
             cleanup(fd, i - 1, parent_info);
             exit(EXIT_FAILURE);
         }
+        //Βρίσκουμε το current maxFD
+        maxFD = calculateMaxFD(parent_info[i].pipeForRead, parent_info[i].pipeForWrite, maxFD);
 
         //Αντιστοιχούμε τα pipes 
         memcpy(child_info.pipeForRead,parent_info[i].pipeForWrite,sizeof(parent_info[i].pipeForWrite));
@@ -110,9 +118,9 @@ int main (int argc, char *argv[]){
             exit(EXIT_FAILURE);
         }
         prepareData(data, sizeof(data), parent_msg, getpid());
-        printf("Data Prepared: %s",data);
+        //printf("Data Prepared: %s",data);
 
-        sem_wait(child_info.childSemWrite);
+        // sem_wait(child_info.childSemWrite);
         //Το παιδί κάνει write στο αρχείο     
         writeToFile(fd, data);
         // sem_post(child_info.childSemWrite);
@@ -140,27 +148,55 @@ int main (int argc, char *argv[]){
         }
     }
     
-    int status;
+    //Το readFromCh δηλώνει από πόσα παιδιά διάβασε ο πατέρας σε ένα select. Το exitedChildren δηλώνει πόσα παιδιά έχουν τερματίσει
+    int status,readFromCh,exitedChildren=0, countSelect=0;
     char child_msg[30];
-    //Ξυπνάει ένα παιδί, διαβάζει το μύνημα του, περιμένει να τελειώσει και ξυπνάει το επόμενο
-    for (int i=0; i < children; i++){
-        //Ξυπνάει το παιδί
-        sem_post(parent_info[i].childSem);
-        //Κάνουμε reset την τιμή του γιατί έχει μυνήματα από προηγούμενα παιδιά
-        strcpy(child_msg,"");
 
-        //Διαβάζει το μύνημα του παιδιού από το pipe
-        if(readFromPipe(parent_info[i].pipeForRead[READ], child_msg, 'p') == -1){
+    //Η select αλλάζει τα περιεχόμενα του set tempfds και όχι του readfds
+    fd_set readfds, tempfds;
+    FD_ZERO(&readfds);
+    //Στο set readfds βάζουμε όλα τα άκρα των pipes που διαβάζει ο πατέρας
+    for (int i = 0; i < children; i++) {
+        FD_SET(parent_info[i].pipeForRead[READ], &readfds);
+    }
+
+    while (1) {
+        readFromCh = 0;
+        tempfds = readfds;
+
+        int ready = select(maxFD + 1, &tempfds, NULL, NULL, NULL);
+        if (ready < 0) {
+            perror("Error: select");
             cleanup(fd, children-1, parent_info);
             exit(EXIT_FAILURE);
         }
-        // printf("Message from %s: %s\n",parent_info[i].childName, child_msg);
-        
-        pid_t child_pid = waitpid(-1, &status, WUNTRACED);//-1 ή 0 νομίζω
-        if (child_pid == -1) {
-            perror("Error: waitpid");
-            cleanup(fd, children-1, parent_info);
-            exit(EXIT_FAILURE);
+        countSelect++;
+        for (int i = 0; i < children; i++) {
+            if (FD_ISSET(parent_info[i].pipeForRead[READ], &tempfds)) {
+                strcpy(child_msg, "");
+                if (readFromPipe(parent_info[i].pipeForRead[READ], child_msg, 'p') == -1) {
+                    cleanup(fd, children-1, parent_info);
+                    exit(EXIT_FAILURE);
+                }
+                //Δεν θα χρειαστούμε άλλο αυτό το fd οπότε το βγάζουμε από το set readfds
+                readFromCh++;
+                FD_CLR(parent_info[i].pipeForRead[READ], &readfds);
+                printf("Message from %s: %s\n", parent_info[i].childName, child_msg);
+            }
+        }
+        //Παίρνει το exit status των παιδιών που τελειώσαν σε αυτό το select
+        for (int i = 0; i < readFromCh; i++) {
+            pid_t child_pid = waitpid(-1, &status, WUNTRACED);//-1 ή 0 νομίζω
+            if (child_pid == -1) {
+                perror("Error: waitpid");
+                cleanup(fd, children-1, parent_info);
+                exit(EXIT_FAILURE);
+            }
+            exitedChildren++;
+        }
+        printf("Select: %d - Available Children for read: %d - In total Exited children: %d\n", countSelect, readFromCh, exitedChildren);
+        if (children == exitedChildren) {
+            break;
         }
     }
 
@@ -233,6 +269,22 @@ int readFromPipe(int pfd, char* message, char c){
     buffer[bytes_read] = '\0';
     strncat(message, buffer, strlen(buffer));
     return 0;
+}
+//Υπολογίζουμε το maxFD
+int calculateMaxFD(int p1fd[2], int p2fd[2], int currentMaxFD) {
+    if (p1fd[0] > currentMaxFD) {
+        currentMaxFD = p1fd[0];
+    }
+    if (p1fd[1] > currentMaxFD) {
+        currentMaxFD = p1fd[1];
+    }
+    if (p2fd[0] > currentMaxFD) {
+        currentMaxFD = p2fd[0];
+    }
+    if (p2fd[1] > currentMaxFD) {
+        currentMaxFD = p2fd[1];
+    }
+    return currentMaxFD;
 }
 //=================================Βοηθητικές συναρτήσεις================================
 //========================================Έλεγχοι========================================
