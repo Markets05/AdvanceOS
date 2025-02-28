@@ -7,7 +7,8 @@ The exercise involves:
 - **Creating a Process Tree**: A parent process spawns multiple child processes, and both write messages to an output file.  
 - **Inter-Process Communication**: Communication between parent and child processes is achieved using pipes, with messages being exchanged in both directions.  
 - **Worker Pool Paradigm**: Idle child processes can be assigned tasks dynamically by the parent process, forming a basic worker pool.  
-- **Graceful Shutdown**: Ensuring proper cleanup of resources and termination of all child processes when the parent process is terminated.  
+- **Graceful Shutdown**: Ensuring proper cleanup of resources and termination of all child processes when the parent process is terminated.
+- **RPC**: There is a simple example of RPC with rpcgen. 
 
 This project is implemented in **C** and runs in a **Linux environment**.  
 
@@ -94,6 +95,29 @@ If you want to terminate the program externally:
    kill -SIGTERM <parent_pid>
    ```  
    This sends a `SIGTERM` signal to the parent process, triggering a clean shutdown. 
+
+## Remote Procedure Call (RPC) with `rpcgen`
+
+This section demonstrates communication between processes using RPC with `rpcgen`.
+
+1. **Compile the RPC files**  
+   Run the following command to compile the server and client files:
+   ```bash
+   make -f Makefile.add
+   ```
+
+2. **Run the Server**  
+   Start the server using:
+   ```bash
+   sudo ./add_server
+   ```
+
+3. **Run the Client**  
+   Connect to the server by running:
+   ```bash
+   ./add_client localhost
+   ```
+The client will connect to the server on localhost and perform RPC calls.
 
 ## Author  
 Xenofon Marketakis it2022063@hua.gr
