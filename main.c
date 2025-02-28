@@ -3,83 +3,86 @@
 #include <sys/wait.h>
 #include <sys/file.h>
 #include <unistd.h>
-#include <semaphore.h>
 #include <fcntl.h>
 #include <string.h>
 #include <sys/select.h>
 #include <sys/types.h>
 #include <errno.h>
-
+#include <signal.h>
 
 #define READ 0
 #define WRITE 1
+#define NOT_IDLE 0
+#define IDLE 1
 
 typedef struct {
-    sem_t* childSemWrite;
     int pipeForRead[2];  
     int pipeForWrite[2]; 
+    char childName[20]; 
 } ChildInfo;
 typedef struct {
     int pipeForRead[2];  
     int pipeForWrite[2]; 
-    sem_t* childSem;
     char childName[20]; 
+    int childIsIdle;
 } ParentInfo;
 
 //Βοηθητικές συναρτήσεις
 void writeToFile(int, const char*);
 void readFromFile(int);
 void check_bytes(ssize_t, char c);
-void prepareData(char*, size_t, const char*, const pid_t);
+void prepareData(char*, size_t, const char*, const char*, char*);
+void getNameFromParent(char*, const char*, char*);
 void check_UInput(int, char**);
 void cleanup(int, int, ParentInfo *);
+void child_cleanup(int , ParentInfo *, pid_t);
 int readFromPipe(int, char*, char);
 int writeToPipe(int, char*, char);
 int calculateMaxFD(int[2] , int[2] , int);
 
+//Διαχείριση Σημάτων SIGTERM, SIGINT (Ctrl+C)
+void kill_child(int);
+void on_sig_term_intr(int);
+
+long children = 0;
+int fd;
+char * filename;
+ParentInfo * parent_info;
+ChildInfo child_info;
+pid_t* childrenPids;
+
 int main (int argc, char *argv[]){
     //Παίρνουμε τα ορίσματα
     check_UInput(argc, argv);
-    char * filename = argv[1];
-    long children = atol(argv[2]);
+    filename = argv[1];
+    children = atol(argv[2]);
 
     //O Γονέας ανοίγει το αρχείο για write
-    int fd;
     if ((fd = open(filename, O_WRONLY | O_CREAT | O_TRUNC, 0600)) ==-1) {
         perror("open for write"); //Απέτυχε η open
         exit(EXIT_FAILURE);
     }
 
     //Δημιουργία πίνακα του πατέρα όπου κάθε στοιχείο είναι τύπου ParentInfo
-    ParentInfo * parent_info = (ParentInfo *)malloc(children * sizeof(ParentInfo));  
+    parent_info = (ParentInfo *) malloc (children * sizeof(ParentInfo));  
     if (parent_info == NULL) { 
-        perror("Error: malloc");
+        perror("Error: malloc for parent info");
         close(fd);
         exit(EXIT_FAILURE);
     }
 
-    //Αρχικοποίηση σεμαφόρων
-    char semName[40];
-    sem_t* tempSem;
-    for (int i = 0; i < children; i++) {
-        snprintf(semName, sizeof(semName), "child_sem_%d", i);
-        sem_unlink(semName);
-        tempSem = sem_open(semName, O_CREAT | O_EXCL, 0600, 0); //Locked
-
-        if (tempSem == SEM_FAILED) {
-            perror("Error: create child semaphore");
-            cleanup(fd, i, parent_info);
-            exit(EXIT_FAILURE);
-        }
-        parent_info[i].childSem = tempSem;
-        snprintf(parent_info[i].childName, sizeof(parent_info[i].childName), "Child %d",i+1);
+    //Δημιουργία πίνακα για τα pid των παιδιών
+    childrenPids = (pid_t *) malloc (children * sizeof(pid_t));
+    if (childrenPids == NULL) { 
+        perror("Error: malloc for children pids");
+        close(fd);free(parent_info);
+        exit(EXIT_FAILURE);
     }
 
     //Διαδικασία fork
     pid_t pid;
-    ChildInfo child_info;
     int maxFD = 0;
-
+    int amountPipes;//Το παιδί ξέρει πόσα pipes του πατέρα να κλείσει
     for (int i=0; i<children; i++){
         //Δημιουργία 2 pipes
         if (pipe(parent_info[i].pipeForWrite) == -1 || pipe(parent_info[i].pipeForRead) == -1) {
@@ -93,152 +96,188 @@ int main (int argc, char *argv[]){
         //Αντιστοιχούμε τα pipes 
         memcpy(child_info.pipeForRead,parent_info[i].pipeForWrite,sizeof(parent_info[i].pipeForWrite));
         memcpy(child_info.pipeForWrite,parent_info[i].pipeForRead,sizeof(parent_info[i].pipeForRead));
-        child_info.childSemWrite = parent_info[i].childSem;
 
         if ((pid = fork()) == -1){
             perror("Error: fork"); //Απέτυχε η fork
-            cleanup(fd, children-1, parent_info);
+            cleanup(fd, i, parent_info);
             exit(EXIT_FAILURE);
         }
         if (pid==0){
+            amountPipes = i;
             break;
         }
+        childrenPids[i] = pid;
+        snprintf(parent_info[i].childName, sizeof(parent_info[i].childName), "Child %d",i+1);
+        parent_info[i].childIsIdle = IDLE;
     }
     
     //Παιδί
     if (pid == 0){
-        char data[100];
-        char parent_msg[60];
-
+        signal(SIGINT, on_sig_term_intr);
+        signal(SIGTERM, on_sig_term_intr);
         close(child_info.pipeForRead[WRITE]);
         close(child_info.pipeForWrite[READ]);
+        child_cleanup(amountPipes, parent_info, getpid());
 
-        //Διαβάζει το μύνημα του πατέρα από το pipe
+        char data[100];
+        char parent_msg[60], child_msg[60];
+
+        //Διαβάζει το όνομα του δηλαδή το πρώτο μύνημα του πατέρα από το pipe
         if(readFromPipe(child_info.pipeForRead[READ], parent_msg, 'c') == -1){
             exit(EXIT_FAILURE);
         }
-        prepareData(data, sizeof(data), parent_msg, getpid());
-        //printf("Data Prepared: %s",data);
-
-        // sem_wait(child_info.childSemWrite);
-        //Το παιδί κάνει write στο αρχείο     
-        writeToFile(fd, data);
-        // sem_post(child_info.childSemWrite);
-        
+        getNameFromParent(child_info.childName, parent_msg, child_msg);
         //Στέλνει μύνημα στον πατέρα μέσω του pipe
-        if (writeToPipe(child_info.pipeForWrite[WRITE], "done", 'c') == -1){
+        if (writeToPipe(child_info.pipeForWrite[WRITE], child_msg, 'c') == -1){
             exit(EXIT_FAILURE);
         }
-        close(child_info.pipeForRead[READ]);
-        close(child_info.pipeForWrite[WRITE]);
-        exit(EXIT_SUCCESS);
+        strcpy(parent_msg, "");
+        strcpy(child_msg, "");
+        //Ξεκινάει το loop που τελειώνει όταν σταλθεί σήμα από τον γονέα στο παιδί
+        while(1){
+            if(readFromPipe(child_info.pipeForRead[READ], parent_msg, 'c') == -1){
+                exit(EXIT_FAILURE);
+            }
+            prepareData(data, sizeof(data), parent_msg, child_info.childName, child_msg);
+
+            //Το παιδί κάνει write στο αρχείο     
+            writeToFile(fd, data);
+            sleep(1);
+            if (writeToPipe(child_info.pipeForWrite[WRITE], child_msg, 'c') == -1){
+                exit(EXIT_FAILURE);
+            }
+            strcpy(parent_msg, "");
+            strcpy(child_msg, "");
+        }
     }
     //Γονέας
-    char msg_toChild[100];
+    signal(SIGINT, kill_child);
+    signal(SIGTERM, kill_child);
 
     for(int i=0; i<children; i++){
         close(parent_info[i].pipeForWrite[READ]);
         close(parent_info[i].pipeForRead[WRITE]);
-        snprintf(msg_toChild, sizeof(msg_toChild), "Hello child, I am your father and I call you: %s", parent_info[i].childName);
-        
-        //Στέλνει μύνημα στο παιδί μέσω του pipe
-        if (writeToPipe(parent_info[i].pipeForWrite[WRITE], msg_toChild, 'p') == -1){
-            cleanup(fd, children-1, parent_info);
-            exit(EXIT_FAILURE);
+    }
+
+    //Το readFromCh δηλώνει από πόσα παιδιά διάβασε ο πατέρας σε ένα select
+    int readFromCh,countSelect=0;
+    int taskCount=0;
+    char msg_toChild[100], child_msg[30];
+    fd_set readfds;
+    while(1){
+        if (taskCount == 0) { //Αρχικό μύνημα με το όνομα του παιδιού
+            for(int i=0; i<children; i++){
+                snprintf(msg_toChild, sizeof(msg_toChild), "Hello child, I am your father and I call you: %s", parent_info[i].childName);
+                //Στέλνει μύνημα στο παιδί μέσω του pipe
+                if (writeToPipe(parent_info[i].pipeForWrite[WRITE], msg_toChild, 'p') == -1){
+                    cleanup(fd, children-1, parent_info);
+                    exit(EXIT_FAILURE);
+                }
+                parent_info[i].childIsIdle = NOT_IDLE;
+                strcpy(msg_toChild, "");
+            }
+        }else{
+            //Ο γονέας στέλνει tasks σε όσα παιδιά είναι idle
+            snprintf(msg_toChild, sizeof(msg_toChild), "Hello child, I am your father and your task is: task%d", taskCount);
+            for(int i=0; i<children; i++){
+                if (parent_info[i].childIsIdle == IDLE){
+                    if (writeToPipe(parent_info[i].pipeForWrite[WRITE], msg_toChild, 'p') == -1){
+                        cleanup(fd, children-1, parent_info);
+                        exit(EXIT_FAILURE);
+                    }
+                    parent_info[i].childIsIdle = NOT_IDLE;
+                }
+            }
         }
-    }
-    
-    //Το readFromCh δηλώνει από πόσα παιδιά διάβασε ο πατέρας σε ένα select. Το exitedChildren δηλώνει πόσα παιδιά έχουν τερματίσει
-    int status,readFromCh,exitedChildren=0, countSelect=0;
-    char child_msg[30];
+        taskCount++;
+        FD_ZERO(&readfds);
 
-    //Η select αλλάζει τα περιεχόμενα του set tempfds και όχι του readfds
-    fd_set readfds, tempfds;
-    FD_ZERO(&readfds);
-    //Στο set readfds βάζουμε όλα τα άκρα των pipes που διαβάζει ο πατέρας
-    for (int i = 0; i < children; i++) {
-        FD_SET(parent_info[i].pipeForRead[READ], &readfds);
-    }
+        //Στο set readfds βάζουμε όλα τα άκρα των pipes που διαβάζει ο πατέρας
+        for (int i = 0; i < children; i++) {
+            FD_SET(parent_info[i].pipeForRead[READ], &readfds);
+        }
 
-    while (1) {
-        readFromCh = 0;
-        tempfds = readfds;
-
-        int ready = select(maxFD + 1, &tempfds, NULL, NULL, NULL);
+        int ready = select(maxFD + 1, &readfds, NULL, NULL, NULL);
         if (ready < 0) {
             perror("Error: select");
             cleanup(fd, children-1, parent_info);
             exit(EXIT_FAILURE);
         }
         countSelect++;
+        readFromCh = 0;
         for (int i = 0; i < children; i++) {
-            if (FD_ISSET(parent_info[i].pipeForRead[READ], &tempfds)) {
+            if (FD_ISSET(parent_info[i].pipeForRead[READ], &readfds)) {
                 strcpy(child_msg, "");
                 if (readFromPipe(parent_info[i].pipeForRead[READ], child_msg, 'p') == -1) {
                     cleanup(fd, children-1, parent_info);
                     exit(EXIT_FAILURE);
                 }
-                //Δεν θα χρειαστούμε άλλο αυτό το fd οπότε το βγάζουμε από το set readfds
+                printf("Message from %s: '%s'\n", parent_info[i].childName, child_msg);
+                parent_info[i].childIsIdle = IDLE;
                 readFromCh++;
-                FD_CLR(parent_info[i].pipeForRead[READ], &readfds);
-                printf("Message from %s: %s\n", parent_info[i].childName, child_msg);
             }
         }
-        //Παίρνει το exit status των παιδιών που τελειώσαν σε αυτό το select
-        for (int i = 0; i < readFromCh; i++) {
-            pid_t child_pid = waitpid(-1, &status, WUNTRACED);//-1 ή 0 νομίζω
-            if (child_pid == -1) {
-                perror("Error: waitpid");
-                cleanup(fd, children-1, parent_info);
-                exit(EXIT_FAILURE);
-            }
-            exitedChildren++;
-        }
-        printf("Select: %d - Available Children for read: %d - In total Exited children: %d\n", countSelect, readFromCh, exitedChildren);
-        if (children == exitedChildren) {
-            break;
-        }
+        printf("Select: %d - Available Children for read: %d\n\n", countSelect, readFromCh);
     }
-
-    //Κλείνει το αρχείο και το ανοίγει για read
-    close(fd);
-    if ((fd = open(filename, O_RDONLY , 0600)) ==-1) {
-        perror("Error: open for read"); //Απέτυχε η open
-        cleanup(fd, children-1, parent_info);
-        exit(EXIT_FAILURE);
-    }
-    //Διαβάζει το αρχείο
-    readFromFile(fd);
-    cleanup(fd, children-1, parent_info);
 }
-
 //=================================Βοηθητικές συναρτήσεις================================
 //Γράφει το process στο αρχείο
 void writeToFile(int fd, const char* data){
     ssize_t bytes_written = write(fd, data, strlen(data));
     check_bytes(bytes_written,'w');
 }
-void prepareData(char* data, size_t dataSize, const char* parent_msg, const pid_t pid) {
+void prepareData(char* data, size_t dataSize, const char* parent_msg, const char* childName, char* child_msg) {
     const char *marker = ": ";
     const char *start = strstr(parent_msg, marker); //Εντοπίζουμε το ": " στο μήνυμα
 
-    char childName[50];
-    size_t copiedBytes = sizeof(childName) - 1;
+    int taskReceived = 0;
+    char task[50];
+    size_t copiedBytes = sizeof(task) - 1;
     if (start != NULL) {
         start += strlen(marker); //Μετακινούμαστε μετά το ": "
-        strncpy(childName, start, copiedBytes);
+        strncpy(task, start, copiedBytes);
+        taskReceived = 1;
     } else {
-        strncpy(childName, "Name not received", copiedBytes);
+        strncpy(task, "Task not received", copiedBytes);
     }
-    childName[copiedBytes] = '\0';
-    snprintf(data, dataSize, "%d ---> %s\n", pid, childName);
+    task[copiedBytes] = '\0';
+    snprintf(data, dataSize, "%s ---> %s\n", childName, task);
+    
+    if (taskReceived){
+        sprintf(child_msg, "%s - Done with %s", childName, task);
+    }else{
+        sprintf(child_msg, "%s didn't receive a valid task", childName);
+    }
+}
+void getNameFromParent(char* childName, const char* parent_msg, char* child_msg) {
+    const char *marker = ": ";
+    const char *start = strstr(parent_msg, marker); //Εντοπίζουμε το ": " στο μήνυμα
+
+    int nameReceived = 0;
+    char tempName[50];
+    size_t copiedBytes = sizeof(tempName) - 1;
+    if (start != NULL) {
+        start += strlen(marker); //Μετακινούμαστε μετά το ": "
+        strncpy(tempName, start, copiedBytes);
+        nameReceived = 1;
+    } else {
+        strncpy(tempName, "Name not received", copiedBytes);
+    }
+    tempName[copiedBytes] = '\0';
+    strcpy(childName,tempName);
+
+    if (nameReceived){
+        sprintf(child_msg, "%s has pid %d",childName, getpid());
+    }else{
+        sprintf(child_msg, "Child with pid %d didn't receive a name", getpid());
+    }
 }
 //Διαβάζει ο γονέας το αρχείο
 void readFromFile(int fd){
     char buffer[100]; 
     ssize_t bytes_read;
 
-    printf("Περιεχόμενο του αρχείου:\n");
+    printf("File content:\n");
 
     //Διαβάζει το αρχείο σε κομμάτια και τα εκτυπώνει
     while ((bytes_read = read(fd, buffer, sizeof(buffer) - 1)) > 0) {
@@ -248,7 +287,7 @@ void readFromFile(int fd){
     check_bytes(bytes_read,'r');
 }
 //Γράφει το μύνημα του στο pipe
-int writeToPipe(int pfd, char* message,char c){
+int writeToPipe(int pfd, char* message, char c){
 
     if (write(pfd, message, strlen(message)) == -1) {
         if (c == 'p') perror("Error: parent sending message to child");
@@ -286,6 +325,51 @@ int calculateMaxFD(int p1fd[2], int p2fd[2], int currentMaxFD) {
     }
     return currentMaxFD;
 }
+//Το kill_child είναι για τον γονέα και το on_sig_term_intr είναι για το παιδί
+void kill_child(int sig){
+    printf("Parent received signal <%d>. Shutting down...\n", sig);
+
+    //Στέλνει το σήμα σε όλα τα παιδιά και περιμένει να τερματιστούν όλα
+    for (int i = 0; i < children; i++) {
+        kill(childrenPids[i],sig);
+    }
+    int status;
+    for (int i = 0; i < children; i++) {
+        pid_t child_pid = waitpid(-1, &status, WUNTRACED);//-1 ή 0 νομίζω
+        if (child_pid == -1) {
+            perror("Error: waitpid");
+            cleanup(fd, children-1, parent_info);
+            exit(EXIT_FAILURE);
+        }
+    }
+    if (sig == 2) printf("All children have been interrupted!\n");
+    if (sig == 15) printf("All children have been terminated!\n");
+
+    //Κλείνει το αρχείο και το ανοίγει για read
+    close(fd);
+    if ((fd = open(filename, O_RDONLY , 0600)) ==-1) {
+        perror("Error: open for read"); //Απέτυχε η open
+        cleanup(fd, children-1, parent_info);
+        exit(EXIT_FAILURE);
+    }
+    //Διαβάζει το αρχείο
+    readFromFile(fd);
+    printf("Pid for children:\n");
+    for (int i=0; i<children; i++){
+        printf("%s - %d\n", parent_info[i].childName, childrenPids[i]);
+    }
+    cleanup(fd, children-1, parent_info);
+
+    exit(EXIT_SUCCESS);
+}
+void on_sig_term_intr(int sig){
+    close(child_info.pipeForRead[READ]);
+    close(child_info.pipeForWrite[WRITE]);
+
+    if (sig == 2) printf("I am child with pid %d and my father just interrupted me!\n", getpid());
+    if (sig == 15) printf("I am child with pid %d and my father just terminated me!\n", getpid());
+    exit(sig);
+}
 //=================================Βοηθητικές συναρτήσεις================================
 //========================================Έλεγχοι========================================
 void check_UInput(int argc, char * argv[]){
@@ -317,12 +401,26 @@ void check_bytes(ssize_t bytes , char c){
 }
 void cleanup(int fd, int children, ParentInfo *parent_info){
     close(fd);
-    char semName[40];
     for (int i = 0; i <= children; i++) {
-        sem_close(parent_info[i].childSem);
-        snprintf(semName, sizeof(semName), "child_sem_%d", i);
-        sem_unlink(semName);
+        close(parent_info[i].pipeForWrite[WRITE]);
+        close(parent_info[i].pipeForWrite[READ]);
+        close(parent_info[i].pipeForRead[WRITE]);
+        close(parent_info[i].pipeForRead[READ]);
     }
+    free(childrenPids);
+    free(parent_info);
+}
+void child_cleanup(int amountPipes, ParentInfo *parent_info, pid_t pid){
+    //Για κάθε παιδί κλείνουμε τα pipes που δεν χρειάζεται δηλαδή τα pipes των άλλων παιδιών
+    for (int i = 0; i <= amountPipes-1; i++) {
+        if (childrenPids[i] != pid){
+            close(parent_info[i].pipeForWrite[WRITE]);
+            close(parent_info[i].pipeForWrite[READ]);
+            close(parent_info[i].pipeForRead[WRITE]);
+            close(parent_info[i].pipeForRead[READ]);
+        }
+    }
+    free(childrenPids);
     free(parent_info);
 }
 //========================================Έλεγχοι========================================

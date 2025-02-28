@@ -16,7 +16,7 @@ This project is implemented in **C** and runs in a **Linux environment**.
 ### Prerequisites  
 - **Linux Environment** (virtual machine or physical hardware).  
 - **C Compiler** (e.g., `gcc`).
-- `make` for building and running the project
+- `make` for building and running the project  
 
 ### Instructions  
 
@@ -73,5 +73,27 @@ make
 ./main output.txt 5  
 ```
 
-## Author
+## Graceful Shutdown  
+
+To ensure proper cleanup, the program supports **graceful shutdown**, terminating all child processes before the parent exits. You can stop the program using one of the following methods:  
+
+### 1️⃣ Pressing `CTRL + C`  
+This sends a `SIGINT` signal to the parent process, triggering a clean shutdown.  
+
+### 2️⃣ Using `kill` from Another Terminal  
+If you want to terminate the program externally:  
+
+1. **Find the parent process ID (`parent_pid`)**:  
+   ```bash
+   ps -e | grep main
+   ```  
+   Identify the smallest `PID` in the output (this is the parent process).  
+
+2. **Send a `SIGTERM` signal**:  
+   ```bash
+   kill -SIGTERM <parent_pid>
+   ```  
+   This sends a `SIGTERM` signal to the parent process, triggering a clean shutdown. 
+
+## Author  
 Xenofon Marketakis it2022063@hua.gr
